@@ -6,9 +6,9 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
-from hextetra_viewer.core import BYTES_PER_GROUP, Buffer, OCTAL_WIDTH, parse_offset, read_line
-from hextetra_viewer.document import BACKUP_SUFFIX, Document
-from hextetra_viewer.render import (
+from hextet_viewer.core import BYTES_PER_GROUP, Buffer, OCTAL_WIDTH, parse_offset, read_line
+from hextet_viewer.document import BACKUP_SUFFIX, Document
+from hextet_viewer.render import (
     DumpView,
     display_number,
     display_offset,
@@ -36,7 +36,7 @@ Editing (in-place, the file length never changes):
     viewer.py sample.bin --set 0d27=37              Overwrite one byte (offset 31, value 0o37)
     viewer.py sample.bin --set 0d27=41_42 --dry-run  Preview without writing
     viewer.py sample.bin --set b64:16=41_42 -b       Write and keep a .bak copy
-    viewer.py sample.bin --edit                      Interactive editor (needs a terminal)
+    viewer.py sample.bin --edit                      Interactive viewer (needs a terminal)
 
 Notes:
     The line width must be a multiple of {BYTES_PER_GROUP}: one byte is 8 bits and one 64-base
@@ -181,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-e",
         "--edit",
         action="store_true",
-        help="open the interactive editor (needs a terminal and a real file)",
+        help="open the interactive viewer (needs a terminal and a real file)",
     )
     parser.add_argument(
         "--dry-run",
@@ -346,7 +346,7 @@ def _run_patch(document: Document, view: DumpView, args: argparse.Namespace) -> 
     return 0
 
 
-def _run_editor(document: Document, offset: int, args: argparse.Namespace) -> int:
+def _run_viewer(document: Document, offset: int, args: argparse.Namespace) -> int:
     """启动交互式编辑器"""
     if not document.writable:
         print("error: --edit needs a file path; standard input cannot be written back", file=sys.stderr)
@@ -355,7 +355,7 @@ def _run_editor(document: Document, offset: int, args: argparse.Namespace) -> in
         print("error: --edit needs an interactive terminal", file=sys.stderr)
         return 1
 
-    from hextetra_viewer.tui import run_tui  # 延迟导入：普通查看用不到终端支持
+    from hextet_viewer.tui import run_tui  # 延迟导入：普通查看用不到终端支持
 
     return run_tui(
         document,
@@ -408,7 +408,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         if args.edit:
-            return _run_editor(document, offset, args)
+            return _run_viewer(document, offset, args)
 
         if offset % BYTES_PER_GROUP:
             print("note: the starting offset is not 3-byte aligned; .. marks values belonging to the previous line", file=sys.stderr)

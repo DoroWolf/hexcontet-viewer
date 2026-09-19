@@ -481,14 +481,14 @@ def run_tui(
         show_ascii=show_ascii,
         human_compatible=human_compatible,
     )
-    editor = Editor(document=document, view=view, backup=backup)
+    viewer = Editor(document=document, view=view, backup=backup)
 
     try:
         with Terminal() as terminal:
             while True:
                 size = shutil.get_terminal_size()
                 rows = max(1, size.lines - len(view.header_lines()) - 1)
-                lines = editor.frame(rows)
+                lines = viewer.frame(rows)
                 terminal.write(
                     HOME
                     + "".join(text + CLEAR_TO_EOL + "\r\n" for text in lines[:-1])
@@ -497,7 +497,7 @@ def run_tui(
                     + CLEAR_TO_END
                 )
                 key = terminal.read_key()
-                if key is not None and editor.handle_key(key) == "quit":
+                if key is not None and viewer.handle_key(key) == "quit":
                     break
     except KeyboardInterrupt:
         pass
