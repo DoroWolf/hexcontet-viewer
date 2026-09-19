@@ -6,9 +6,9 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
-from hextet_viewer.core import BYTES_PER_GROUP, Buffer, OCTAL_WIDTH, parse_offset, read_line
-from hextet_viewer.document import BACKUP_SUFFIX, Document
-from hextet_viewer.render import (
+from hexcontet_viewer.core import BYTES_PER_GROUP, Buffer, OCTAL_WIDTH, parse_offset, read_line
+from hexcontet_viewer.document import BACKUP_SUFFIX, Document
+from hexcontet_viewer.render import (
     DumpView,
     display_number,
     display_offset,
@@ -355,7 +355,7 @@ def _run_viewer(document: Document, offset: int, args: argparse.Namespace) -> in
         print("error: --edit needs an interactive terminal", file=sys.stderr)
         return 1
 
-    from hextet_viewer.tui import run_tui  # 延迟导入：普通查看用不到终端支持
+    from hexcontet_viewer.tui import run_tui  # 延迟导入：普通查看用不到终端支持
 
     return run_tui(
         document,

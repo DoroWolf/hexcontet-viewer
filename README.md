@@ -1,4 +1,4 @@
-# HEXTET Viewer
+# HEXCONTET Viewer
 
 > 从平行世界移植的 64 进制文件查看器。
 
@@ -159,10 +159,10 @@ uv run python viewer.py sample.bin --edit                         # 交互式编
 ## 目录结构
 
 ```text
-hextet-viewer/
+hexcontet-viewer/
 ├── pyproject.toml            # requires-python >=3.12，零依赖，[tool.uv] package = false
 ├── viewer.py                 # 命令行入口：参数解析 + 输出 + 一次性改写
-└── hextet_viewer/
+└── hexcontet_viewer/
     ├── core.py               # 纯算法：字节 ⇄ 6 bit 单元，偏移解析
     ├── render.py             # 列宽计算、行渲染、ANSI 配色、改动/光标高亮
     ├── document.py           # 数据源：文件 mmap / 标准输入，等长改写、撤销栈、原子写回

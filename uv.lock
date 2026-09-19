@@ -3,6 +3,6 @@ revision = 3
 requires-python = ">=3.12"
 
 [[package]]
-name = "hextet-viewer"
+name = "hexcontet-viewer"
 version = "0.1.0"
 source = { virtual = "." }
