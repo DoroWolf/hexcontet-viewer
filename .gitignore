@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 工具缓存
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# 编辑器目录
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store

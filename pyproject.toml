@@ -1,0 +1,10 @@
+[project]
+name = "hextetra-viewer"
+version = "0.1.0"
+description = "64 进制文件查看器：中间列用两位八进制写 64 进制数字，右栏是标准 Base64"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false
