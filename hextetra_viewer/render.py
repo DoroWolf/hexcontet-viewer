@@ -1,32 +1,22 @@
-"""把 :mod:`hextetra_viewer.core` 的行结构渲染成终端文本。
-
-列布局（默认每行 12 字节）：
-
-    偏移      中间列                                      | Base64              | ASCII
-    00000000  20 24 11 03  20 24 11 03  ...              | QUJD QUJD ...       | ABC...
-
-中间列每个单元固定 2 个字符、分组之间 2 个空格；右栏每个单元固定 1 个字符，
-同样按 3 字节分组（4 个 Base64 字符）用 2 个空格分开，与中间列的分组一一对应。
-两列宽度不同（2 字符 vs 1 字符），所以只保证分组对应、列首对齐。
-
-着色只影响偏移列、Base64 列、占位符与不可打印字符，纯文本管道里可以完全关掉。
-"""
-
 from __future__ import annotations
 
 import os
 import sys
 import unicodedata
-from dataclasses import dataclass
-from typing import Iterator
+from dataclasses import dataclass, replace
+from typing import Iterable, Iterator
 
 from .core import (
     CELLS_PER_GROUP,
+    DUODECIMAL_DIGITS,
     OCTAL_WIDTH,
+    OFFSET_ALPHABET,
     Buffer,
     Cell,
     Line,
     Slot,
+    format_count,
+    format_offset,
     read_line,
     slot_window,
 )
@@ -35,6 +25,7 @@ from .core import (
 RESET = "\x1b[0m"
 DIM = "\x1b[2m"
 CYAN = "\x1b[36m"
+REVERSE = "\x1b[7m"
 
 #: 列与单元之间的分隔符
 OFFSET_SEP = "  "
@@ -47,39 +38,37 @@ PLACEHOLDER_OCTAL = ".."
 PLACEHOLDER_CHAR = "."
 BLANK_OCTAL = " " * OCTAL_WIDTH
 BLANK_CHAR = " "
-OFFSET_ALPHABET = "01234568abcd"
-HUMAN_OFFSET_ALPHABET = "0123456789ab"
+#: ``human_compatible`` 时的标准十二进制数字，同时也是 ``0d`` 偏移输入用的字母表
+HUMAN_OFFSET_ALPHABET = DUODECIMAL_DIGITS
+#: 偏移列最少显示多少位十二进制数字
+MIN_OFFSET_DIGITS = 8
 
 
 
 @dataclass(frozen=True, slots=True)
 class Palette:
-    """终端配色；``enabled`` 为 False 时所有方法原样返回文本"""
-
     enabled: bool = False
 
     def _wrap(self, code: str, text: str) -> str:
         return f"{code}{text}{RESET}" if self.enabled else text
 
     def offset(self, text: str) -> str:
-        """偏移列：暗色"""
         return self._wrap(DIM, text)
 
     def base64(self, text: str) -> str:
-        """右栏 Base64 字符：青色"""
         return self._wrap(CYAN, text)
 
     def muted(self, text: str) -> str:
-        """占位符与 '=' 补位：暗色"""
         return self._wrap(DIM, text)
 
     def ascii(self, text: str, *, printable: bool) -> str:
-        """ASCII 列：不可打印字符用暗色"""
         return text if printable else self._wrap(DIM, text)
+
+    def highlight(self, text: str) -> str:
+        return self._wrap(REVERSE, text)
 
 
 def resolve_palette(mode: str = "auto") -> Palette:
-    """解析 ``--color`` 取值：auto 时看标准输出是否是终端，并尊重 NO_COLOR"""
     if mode == "always":
         return Palette(True)
     if mode == "never":
@@ -93,24 +82,57 @@ def resolve_palette(mode: str = "auto") -> Palette:
 
 
 def display_width(text: str) -> int:
-    """终端显示宽度：全角字符占 2 列（用标准库 unicodedata，不引入依赖）"""
     return sum(2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
 
 
+def display_digits(text: str, *, human_compatible: bool = False) -> str:
+    if human_compatible:
+        return text
+    return text.replace("7", "8")
+
+
+def display_octal(octal: str, *, human_compatible: bool = False) -> str:
+    if len(octal) != OCTAL_WIDTH:
+        return octal
+    return display_digits(octal, human_compatible=human_compatible)
+
+
+def offset_digits(size: int) -> int:
+    digits = MIN_OFFSET_DIGITS
+    limit = 12 ** digits
+    while size > limit:
+        digits += 1
+        limit *= 12
+    return digits
+
+
+def display_number(value: int, *, human_compatible: bool = False) -> str:
+    if human_compatible:
+        return str(value)
+    return format_count(value)
+
+
+def display_offset(
+    offset: int,
+    digits: int,
+    *,
+    prefix: bool = True,
+    human_compatible: bool = False,
+) -> str:
+    alphabet = HUMAN_OFFSET_ALPHABET if human_compatible else OFFSET_ALPHABET
+    return format_offset(offset, digits, prefix, alphabet)
+
+
 def pad_to(text: str, width: int) -> str:
-    """按显示宽度右补空格，中英混排的表头也能对齐"""
     return text + " " * max(0, width - display_width(text))
 
 
 def fit_title(long_title: str, short_title: str, width: int) -> str:
-    """列太窄时换成短标题，避免表头把列挤歪"""
     return long_title if display_width(long_title) <= width else short_title
 
 
 @dataclass(frozen=True, slots=True)
 class DumpView:
-    """一次转储的布局参数，表头与数据行共用它来保证逐列对齐"""
-
     width: int
     offset: int
     slots: int
@@ -118,6 +140,9 @@ class DumpView:
     show_ascii: bool
     palette: Palette
     human_compatible: bool = False
+    changed: frozenset[int] = frozenset()
+    changed_cells: frozenset[int] = frozenset()
+    cursor: int | None = None
 
     @classmethod
     def create(
@@ -129,44 +154,63 @@ class DumpView:
         palette: Palette,
         show_ascii: bool = True,
         human_compatible: bool = False,
+        changed: frozenset[int] | None = None,
+        changed_cells: frozenset[int] | None = None,
+        cursor: int | None = None,
     ) -> DumpView:
-        """按数据大小决定偏移列的宽度：< 4 GiB 用 8 位十六进制，否则 16 位"""
         return cls(
             width=width,
             offset=offset,
             slots=slot_window(width, offset),
-            offset_width=8 if size <= 0xFFFFFFFF else 16,
+            offset_width=offset_digits(size),
             show_ascii=show_ascii,
             palette=palette,
             human_compatible=human_compatible,
+            changed=frozenset(changed) if changed else frozenset(),
+            changed_cells=frozenset(changed_cells) if changed_cells else frozenset(),
+            cursor=cursor,
+        )
+
+    def with_cursor(self, cursor: int | None) -> DumpView:
+        return replace(self, cursor=cursor)
+
+    def with_changes(
+        self,
+        changed: Iterable[int] = (),
+        changed_cells: Iterable[int] = (),
+    ) -> DumpView:
+        return replace(
+            self,
+            changed=frozenset(changed),
+            changed_cells=frozenset(changed_cells),
         )
 
     @property
+    def offset_field_width(self) -> int:
+        return display_width(self._offset_text(0))
+
+    @property
     def groups(self) -> int:
-        """一行里的 3 字节分组个数"""
         return self.slots // CELLS_PER_GROUP
 
     @property
     def middle_width(self) -> int:
-        """中间列的字符宽度"""
         per_group = CELLS_PER_GROUP * OCTAL_WIDTH + (CELLS_PER_GROUP - 1) * len(CELL_SEP)
         return self.groups * per_group + (self.groups - 1) * len(GROUP_SEP)
 
     @property
     def base64_width(self) -> int:
-        """Base64 列的字符宽度"""
         return self.groups * CELLS_PER_GROUP + (self.groups - 1) * len(GROUP_SEP)
 
     def header_lines(self) -> list[str]:
-        """表头：一行说明 + 一行列名"""
         titles = (
-            fit_title("Offset", "OFF", self.offset_width),
+            fit_title("Offset", "OFF", self.offset_field_width),
             fit_title("Octal", "OCT", self.middle_width),
             fit_title("Base64", "B64", self.base64_width),
             fit_title("ASCII", "ASC", self.width),
         )
         row = (
-            pad_to(titles[0], self.offset_width)
+            pad_to(titles[0], self.offset_field_width)
             + OFFSET_SEP
             + pad_to(titles[1], self.middle_width)
             + COLUMN_SEP
@@ -177,7 +221,6 @@ class DumpView:
         return [self.palette.muted(row)]
 
     def line(self, item: Line) -> str:
-        """渲染一行"""
         groups = range(0, self.slots, CELLS_PER_GROUP)
         middle = GROUP_SEP.join(
             CELL_SEP.join(self._octal_text(slot) for slot in item.slots[start : start + CELLS_PER_GROUP])
@@ -195,29 +238,16 @@ class DumpView:
             + encoded
         )
         if self.show_ascii:
-            return text + COLUMN_SEP + self._ascii_text(item.ascii_text)
+            return text + COLUMN_SEP + self._ascii_text(item.ascii_text, item.offset)
         return text.rstrip()
 
     def _offset_text(self, offset: int) -> str:
-            alphabet = HUMAN_OFFSET_ALPHABET if self.human_compatible else OFFSET_ALPHABET
-            
-            # 将 offset 转换为十二进制
-            if offset == 0:
-                digits = "0"
-            else:
-                raw_digits = []
-                val = offset
-                while val > 0:
-                    raw_digits.append(alphabet[val % 12])
-                    val //= 12
-                digits = "".join(reversed(raw_digits))
-            
-            # 补齐指定宽度
-            digits = digits.zfill(self.offset_width)
-            
-            # 如果 alphabet 刚好就是 HUMAN_OFFSET_ALPHABET，直接返回；
-            # 若需要映射到其他字符集，可以在此保留 translate 逻辑。
-            return digits
+        return display_offset(
+            offset,
+            self.offset_width,
+            prefix=False,
+            human_compatible=self.human_compatible,
+        )
 
     def render(
         self,
@@ -227,11 +257,6 @@ class DumpView:
         max_bytes: int | None = None,
         max_lines: int | None = None,
     ) -> Iterator[str]:
-        """依次产出表头与数据行。
-
-        ``max_bytes`` / ``max_lines`` 用于 ``--length`` / ``--lines``：
-        只影响产出的行数，不影响槽位窗口，所以列宽始终一致。
-        """
         size = len(data)
         if header:
             yield from self.header_lines()
@@ -250,15 +275,15 @@ class DumpView:
             yield self.line(read_line(data, offset, self.width, max_bytes=remaining))
 
     def _render_octal(self, text: str) -> str:
-        """把八进制显示中的所有 ``7`` 替换成 ``8``，但保留真实 64 进制值不变。
+        return display_octal(text, human_compatible=self.human_compatible)
 
-        这只是显示层转换，不会改写 ``Cell.octal`` 之类的核心数据。
-        """
-        if self.human_compatible:
-            return text
-        if len(text) != OCTAL_WIDTH:
-            return text
-        return text.replace("7", "8")
+    def _mark(self, text: str, *, index: int) -> str:
+        """命中光标优先反显，其次是真正被改写过的单元"""
+        if self.cursor is not None and index == self.cursor:
+            return self.palette.highlight(text)
+        if index in self.changed_cells:
+            return self.palette.highlight(text)
+        return text
 
     def _octal_text(self, slot: Slot) -> str:
         if slot is None:
@@ -266,15 +291,25 @@ class DumpView:
         if isinstance(slot, Cell):
             if slot.is_padding:
                 return self.palette.muted(slot.octal)
-            return self._render_octal(slot.octal)
+            return self._mark(self._render_octal(slot.octal), index=slot.index)
         return self.palette.muted(PLACEHOLDER_OCTAL)
 
     def _char_text(self, slot: Slot) -> str:
         if slot is None:
             return BLANK_CHAR
         if isinstance(slot, Cell):
-            return self.palette.muted(slot.char) if slot.is_padding else self.palette.base64(slot.char)
+            if slot.is_padding:
+                return self.palette.muted(slot.char)
+            return self._mark(self.palette.base64(slot.char), index=slot.index)
         return self.palette.muted(PLACEHOLDER_CHAR)
 
-    def _ascii_text(self, text: str) -> str:
-        return "".join(self.palette.ascii(char, printable=char != ".") for char in text)
+    def _ascii_text(self, text: str, offset: int) -> str:
+        if not self.changed:  # 常规查看的快路径：不逐字符判断改动
+            return "".join(self.palette.ascii(char, printable=char != ".") for char in text)
+        parts = []
+        for index, char in enumerate(text):
+            colored = self.palette.ascii(char, printable=char != ".")
+            if offset + index in self.changed:
+                colored = self.palette.highlight(colored)
+            parts.append(colored)
+        return "".join(parts)

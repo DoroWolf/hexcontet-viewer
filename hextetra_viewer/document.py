@@ -1,37 +1,69 @@
-"""数据源：文件（mmap 只读、零拷贝翻页）或标准输入。
+"""数据源：文件（mmap 只读、零拷贝翻页）或标准输入，并支持等长原地编辑。
 
-V1 只有只读能力，:meth:`Document.overwrite` / :meth:`Document.save`
-是给将来的编辑功能预留的接缝：接上编辑时只要把只读的 mmap 换成
-可写的 ``bytearray`` 后端，渲染层与定位逻辑都不需要改。
+查看时文件走只读 mmap（超大文件也不吃内存）；一旦调用 :meth:`Document.overwrite`
+就把后端升级成可写的 ``bytearray``（copy-on-write，只做一次），同时记录撤销栈。
+改写严格保持数据长度不变，所以偏移语义、槽位窗口与标准 Base64 对齐规则都不受影响。
+
+写回源文件用「同目录临时文件 + :func:`os.replace`」原子替换，
+``backup=True`` 时先把原文件复制成 ``<文件名>.bak``。
 """
 
 from __future__ import annotations
 
 import mmap
+import os
+import shutil
 import sys
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Iterator
 
-#: 空文件无法 mmap，统一用空 bytes 表示
+from .core import changed_cell_indices, format_count, format_offset
+
 EMPTY_DATA = b""
+
+BACKUP_SUFFIX = ".bak"
+
+
+@dataclass(frozen=True, slots=True)
+class Edit:
+    offset: int
+    before: bytes
+    after: bytes
+
+    @property
+    def length(self) -> int:
+        return len(self.after)
+
+    @property
+    def end(self) -> int:
+        return self.offset + self.length
+
+    def byte_changes(self) -> Iterator[tuple[int, int, int]]:
+        for index, (old, new) in enumerate(zip(self.before, self.after)):
+            if old != new:
+                yield self.offset + index, old, new
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:  # pragma: no cover - 权限/占用等极端情况
+        pass
 
 
 @dataclass(slots=True)
 class Document:
-    """一份待查看的数据。
-
-    ``path`` 为 ``None`` 表示数据来自标准输入。
-    """
-
     path: Path | None
     size: int
-    _data: bytes | mmap.mmap
+    _data: bytes | bytearray | mmap.mmap
     _handle: BinaryIO | None = None
+    _edits: list[Edit] = field(default_factory=list)
+    _undone: list[Edit] = field(default_factory=list)
 
     @classmethod
     def open(cls, path: Path) -> Document:
-        """以只读 mmap 打开文件；空文件退化为空 bytes"""
         handle = path.open("rb")
         try:
             size = path.stat().st_size
@@ -47,32 +79,155 @@ class Document:
 
     @classmethod
     def from_stdin(cls) -> Document:
-        """把标准输入全部读进内存（管道无法 mmap）"""
         data = sys.stdin.buffer.read()
         return cls(path=None, size=len(data), _data=data, _handle=None)
 
     @property
-    def data(self) -> bytes | mmap.mmap:
-        """底层数据，支持 ``len()`` 与切片"""
+    def data(self) -> bytes | bytearray | mmap.mmap:
         return self._data
 
     @property
     def display_name(self) -> str:
-        """用于提示信息的名字"""
         return str(self.path) if self.path is not None else "standard input"
 
+    @property
+    def writable(self) -> bool:
+        return self.path is not None
+
+    @property
+    def dirty(self) -> bool:
+        return bool(self._edits)
+
+    @property
+    def edits(self) -> tuple[Edit, ...]:
+        return tuple(self._edits)
+
+    @property
+    def changed_offsets(self) -> frozenset[int]:
+        return frozenset(
+            offset for edit in self._edits for offset, _old, _new in edit.byte_changes()
+        )
+
+    @property
+    def changed_cells(self) -> frozenset[int]:
+        cells: set[int] = set()
+        for edit in self._edits:
+            cells |= changed_cell_indices(edit.offset, edit.before, edit.after)
+        return frozenset(cells)
+
     def view(self, offset: int = 0, length: int | None = None) -> memoryview:
-        """取一片只读视图；mmap 下不复制任何数据"""
-        view = memoryview(self._data)
+        view = memoryview(self._data).toreadonly()
         end = len(view) if length is None else offset + length
         return view[offset:end]
 
-    def close(self) -> None:
-        if isinstance(self._data, mmap.mmap) and not self._data.closed:
-            self._data.close()
+
+    def overwrite(self, offset: int, payload: bytes) -> Edit:
+        patch = bytes(payload)
+        if not patch:
+            raise ValueError("bytys to write cannot be empty")
+        if offset < 0:
+            raise ValueError("offset cannot be negative")
+        if offset + len(patch) > self.size:
+            raise ValueError(
+                f"offset {format_offset(offset, 1)} + {format_count(len(patch))} bytes"
+                f" exceeds {self.display_name} ({format_count(self.size)} bytes)"
+            )
+
+        data = self._make_mutable()
+        before = bytes(data[offset : offset + len(patch)])
+        data[offset : offset + len(patch)] = patch
+        edit = Edit(offset=offset, before=before, after=patch)
+        self._edits.append(edit)
+        self._undone.clear()
+        return edit
+
+    def undo(self) -> Edit | None:
+        if not self._edits:
+            return None
+        edit = self._edits.pop()
+        self._restore(edit.before, edit.offset)
+        self._undone.append(edit)
+        return edit
+
+    def redo(self) -> Edit | None:
+        if not self._undone:
+            return None
+        edit = self._undone.pop()
+        self._restore(edit.after, edit.offset)
+        self._edits.append(edit)
+        return edit
+
+    def _restore(self, payload: bytes, offset: int) -> None:
+        data = self._make_mutable()
+        data[offset : offset + len(payload)] = payload
+
+    def _make_mutable(self) -> bytearray:
+        data = self._data
+        if isinstance(data, bytearray):
+            return data
+        buffer = bytearray(data)
+        if isinstance(data, mmap.mmap) and not data.closed:
+            data.close()
+        self._data = buffer
+        return buffer
+
+    def _release(self) -> None:
+        data = self._data
+        if isinstance(data, mmap.mmap) and not data.closed:
+            data.close()
         if self._handle is not None and not self._handle.closed:
             self._handle.close()
         self._handle = None
+
+    def _reopen(self) -> None:
+        if self.path is None:
+            return
+        self._release()
+        try:
+            fresh = Document.open(self.path)
+        except OSError:  # pragma: no cover - 文件被删除/权限变化时保持内存后端
+            return
+        self._data = fresh.data
+        self._handle = fresh._handle
+
+    def save(self, *, backup: bool = False) -> bool:
+        if self.path is None:
+            raise OSError("standard input cannot be saved")
+        if not self._edits:
+            return False
+
+        path = self.path
+        payload = bytes(self._make_mutable())
+        handle, temp_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f"{path.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(handle, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if backup:
+                shutil.copy2(path, path.with_name(path.name + BACKUP_SUFFIX))
+        except BaseException:
+            _remove_quietly(temp_name)
+            raise
+
+        # Windows 上源文件仍被打开时 os.replace 会失败，先释放句柄再替换
+        self._release()
+        try:
+            os.replace(temp_name, path)
+        except BaseException:
+            _remove_quietly(temp_name)
+            self._reopen()
+            raise
+
+        self._edits.clear()
+        self._undone.clear()
+        self._reopen()
+        return True
+
+    def close(self) -> None:
+        self._release()
 
     def __enter__(self) -> Document:
         return self
@@ -80,13 +235,3 @@ class Document:
     def __exit__(self, *exc_info: object) -> bool:
         self.close()
         return False
-
-    # ---------- 以下为将来的编辑功能预留（V1 不实现） ----------
-
-    def overwrite(self, offset: int, payload: bytes) -> None:
-        """覆盖 ``[offset, offset + len(payload))`` 的字节（预留）"""
-        raise NotImplementedError("编辑功能尚未实现（V1 只读）")
-
-    def save(self, *, backup: bool = False) -> None:
-        """把修改写回源文件（预留，计划用临时文件 + os.replace 原子写回）"""
-        raise NotImplementedError("编辑功能尚未实现（V1 只读）")
